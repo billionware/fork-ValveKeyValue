@@ -72,14 +72,15 @@ namespace ValveKeyValue.Deserialization.KeyValues1
         {
             var type = ReadNextNodeType();
 
-            if (type == endMarker)
+            if (type is KV1BinaryNodeType.End or KV1BinaryNodeType.AlternateEnd)
             {
                 return;
             }
 
             ReadValue(type);
 
-            if (ReadNextNodeType() != endMarker)
+            var nextType = ReadNextNodeType();
+            if (nextType != KV1BinaryNodeType.End && nextType != KV1BinaryNodeType.AlternateEnd)
             {
                 throw new KeyValueException($"Found data after the root object at offset {stream.Position}, documents with multiple root objects are not supported.");
             }
