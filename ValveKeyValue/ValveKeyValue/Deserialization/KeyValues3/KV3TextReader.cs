@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Globalization;
 using ValveKeyValue.Abstraction;
 
@@ -33,7 +34,17 @@ namespace ValveKeyValue.Deserialization.KeyValues3
             ObjectDisposedException.ThrowIf(disposed, this);
 
             var headerStart = tokenReader.CharOffset;
-            var header = skipHeader ? new KVHeader() : tokenReader.ReadHeader();
+            KVHeader header;
+
+            try
+            {
+                header = skipHeader ? new KVHeader() : tokenReader.ReadHeader();
+            }
+            catch (EndOfStreamException ex)
+            {
+                throw new KeyValueException("Found end of file while reading the KV3 header.", ex);
+            }
+
             if (sourceMap != null && !skipHeader)
             {
                 sourceMap.Add(new KvSourceSpan(headerStart, tokenReader.CharOffset, KVTokenType.Header));
@@ -47,13 +58,9 @@ namespace ValveKeyValue.Deserialization.KeyValues3
                 {
                     token = tokenReader.ReadNextToken();
                 }
-                catch (InvalidDataException ex)
-                {
-                    throw new KeyValueException(ex.Message, ex);
-                }
                 catch (EndOfStreamException ex)
                 {
-                    throw new KeyValueException("Found end of file while trying to read token.", ex);
+                    throw new KeyValueException($"Found end of file while trying to read the token that started at {tokenReader.TokenStartPosition}.", ex);
                 }
 
                 if (sourceMap != null && token.TokenType != KVTokenType.EndOfFile)
@@ -83,7 +90,7 @@ namespace ValveKeyValue.Deserialization.KeyValues3
 
                     case KVTokenType.Identifier:
                     case KVTokenType.String:
-                        ReadText(token.Value!);
+                        ReadText(token.Value!, isQuoted: token.TokenType == KVTokenType.String);
                         break;
 
                     case KVTokenType.BinaryBlob:
@@ -95,6 +102,9 @@ namespace ValveKeyValue.Deserialization.KeyValues3
                         break;
 
                     case KVTokenType.ObjectEnd:
+                        // A '}' at document level after the root value would otherwise pop the
+                        // document pseudo-object and silently ignore all remaining data.
+                        ThrowIfAfterRootValue();
                         FinalizeCurrentObject(@explicit: true);
                         break;
 
@@ -103,19 +113,12 @@ namespace ValveKeyValue.Deserialization.KeyValues3
                         break;
 
                     case KVTokenType.ArrayEnd:
+                        ThrowIfAfterRootValue();
                         FinalizeCurrentArray();
                         break;
 
                     case KVTokenType.EndOfFile:
-                        try
-                        {
-                            FinalizeDocument();
-                        }
-                        catch (InvalidOperationException ex)
-                        {
-                            throw new KeyValueException("Found end of file when another token type was expected.", ex);
-                        }
-
+                        FinalizeDocument();
                         break;
 
                     case KVTokenType.Comment:
@@ -142,117 +145,151 @@ namespace ValveKeyValue.Deserialization.KeyValues3
         {
             if (stateMachine.Current != KV3TextReaderState.InObjectAfterKey)
             {
-                throw new InvalidOperationException($"Attempted to assign while in state {stateMachine.Current}.");
+                throw new KeyValueException($"Attempted to assign while in state {stateMachine.Current} at {tokenReader.TokenStartPosition}.");
             }
+
+            stateMachine.Set(KV3TextReaderState.InObjectBeforeValue);
         }
 
+        // Array elements must be separated by a comma, and a trailing comma is allowed.
         void ReadComma()
         {
-            if (stateMachine.Current != KV3TextReaderState.InArray)
+            if (stateMachine.Current != KV3TextReaderState.InArrayAfterValue)
             {
-                throw new InvalidOperationException($"Attempted to have a comma character while in state {stateMachine.Current}.");
+                throw new KeyValueException($"Attempted to have a comma character while in state {stateMachine.Current} at {tokenReader.TokenStartPosition}.");
+            }
+
+            stateMachine.Set(KV3TextReaderState.InArray);
+        }
+
+        // A value may only start as an array element or after "key =".
+        void ThrowIfNotExpectingValue(string what)
+        {
+            if (stateMachine.Current is KV3TextReaderState.InArray or KV3TextReaderState.InObjectBeforeValue)
+            {
+                return;
+            }
+
+            ThrowIfAfterRootValue();
+
+            var message = stateMachine.Current switch
+            {
+                KV3TextReaderState.InObjectAfterKey => $"Expected '=' after key '{stateMachine.CurrentName}'",
+                KV3TextReaderState.InArrayAfterValue => "Expected ',' or ']' between array elements",
+                _ => $"Attempted to read {what} while in state {stateMachine.Current}",
+            };
+
+            throw new KeyValueException($"{message} at {tokenReader.TokenStartPosition}.");
+        }
+
+        void AddValue(KVObject value)
+        {
+            if (stateMachine.IsInArray)
+            {
+                listener.OnArrayValue(value);
+            }
+            else
+            {
+                listener.OnKeyValuePair(stateMachine.CurrentName!, value);
+            }
+
+            SetStateAfterValue();
+        }
+
+        // A finished value, including an array or object, is followed by a comma in an array or by the next key.
+        void SetStateAfterValue()
+        {
+            if (stateMachine.IsInObject)
+            {
+                stateMachine.Set(stateMachine.IsInArray ? KV3TextReaderState.InArrayAfterValue : KV3TextReaderState.InObjectBeforeKey);
             }
         }
 
         void ReadFlag(string text)
         {
-            if (stateMachine.Current != KV3TextReaderState.InArray && stateMachine.Current != KV3TextReaderState.InObjectAfterKey)
-            {
-                throw new InvalidOperationException($"Attempted to read flag while in state {stateMachine.Current}.");
-            }
+            ThrowIfNotExpectingValue("flag");
 
-            var flag = ParseFlag(text);
+            var flag = ParseFlag(text) ?? throw new KeyValueException($"Unknown flag '{text}' at {tokenReader.TokenStartPosition}.");
 
             stateMachine.SetFlag(flag);
         }
 
-        void ReadText(string text)
+        // The document pseudo-object is only ever in InObjectBeforeKey once the root value
+        // has been fully read, so any further data-bearing token at that point is trailing garbage.
+        void ThrowIfAfterRootValue()
         {
-            switch (stateMachine.Current)
+            if (stateMachine.IsAtDocumentLevel && stateMachine.Current == KV3TextReaderState.InObjectBeforeKey)
             {
-                case KV3TextReaderState.InArray:
-                    {
-                        var value = ParseValue(text);
-                        value.Flag = stateMachine.GetAndResetFlag();
-                        listener.OnArrayValue(value);
-                        break;
-                    }
-
-                case KV3TextReaderState.InObjectBeforeKey:
-                    SetObjectKey(text);
-                    break;
-
-                case KV3TextReaderState.InObjectAfterKey:
-                    {
-                        var name = stateMachine.CurrentName!;
-                        var value = ParseValue(text);
-                        value.Flag = stateMachine.GetAndResetFlag();
-                        listener.OnKeyValuePair(name, value);
-
-                        stateMachine.Push(KV3TextReaderState.InObjectBeforeKey);
-                        break;
-                    }
-
-                default:
-                    throw new InvalidOperationException($"Unhandled text reader state: {stateMachine.Current}.");
+                throw new KeyValueException($"Found data after the root value at {tokenReader.TokenStartPosition}, documents with multiple root values are not supported.");
             }
+        }
+
+        void ReadText(string text, bool isQuoted)
+        {
+            ThrowIfAfterRootValue();
+
+            if (stateMachine.Current == KV3TextReaderState.InObjectBeforeKey)
+            {
+                if (!isQuoted && !KV3TokenReader.IsIdentifier(text))
+                {
+                    throw new KeyValueException($"Invalid key '{text}' at {tokenReader.TokenStartPosition}, keys that are not identifiers must be quoted.");
+                }
+
+                SetObjectKey(text);
+                return;
+            }
+
+            ThrowIfNotExpectingValue("value");
+
+            KVObject value;
+
+            if (isQuoted)
+            {
+                value = new KVObject(text);
+            }
+            else
+            {
+                value = ParseValue(text) ?? throw new KeyValueException($"Invalid value '{text}' at {tokenReader.TokenStartPosition}, strings must be quoted.");
+            }
+
+            value.Flag = stateMachine.GetAndResetFlag();
+            AddValue(value);
         }
 
         void ReadBinaryBlob(string text)
         {
-            var bytes = HexStringHelper.ParseHexStringAsByteArray(text);
+            ThrowIfNotExpectingValue("binary blob");
+
+            if (!HexStringHelper.TryParseHexStringAsByteArray(text, out var bytes))
+            {
+                throw new KeyValueException($"Invalid binary blob at {tokenReader.TokenStartPosition}, expected pairs of hexadecimal digits.");
+            }
+
             var value = KVObject.Blob(bytes);
             value.Flag = stateMachine.GetAndResetFlag();
-
-            switch (stateMachine.Current)
-            {
-                case KV3TextReaderState.InArray:
-                    {
-                        listener.OnArrayValue(value);
-                        break;
-                    }
-
-                case KV3TextReaderState.InObjectAfterKey:
-                    {
-                        var name = stateMachine.CurrentName!;
-                        listener.OnKeyValuePair(name, value);
-
-                        stateMachine.Push(KV3TextReaderState.InObjectBeforeKey);
-                        break;
-                    }
-
-                default:
-                    throw new InvalidOperationException($"Unhandled text reader state: {stateMachine.Current}.");
-            }
+            AddValue(value);
         }
 
         void BeginNewArray()
         {
-            if (stateMachine.Current != KV3TextReaderState.InArray && stateMachine.Current != KV3TextReaderState.InObjectAfterKey)
-            {
-                throw new InvalidOperationException($"Attempted to begin new array while in state {stateMachine.Current}.");
-            }
+            ThrowIfNotExpectingValue("array");
 
             listener.OnArrayStart(stateMachine.CurrentName, stateMachine.GetAndResetFlag(), 0, false);
 
             stateMachine.PushObject();
             stateMachine.SetArrayCurrent();
-            stateMachine.Push(KV3TextReaderState.InArray);
+            stateMachine.Set(KV3TextReaderState.InArray);
         }
 
         void FinalizeCurrentArray()
         {
-            if (stateMachine.Current != KV3TextReaderState.InArray)
+            if (!stateMachine.IsInArray)
             {
-                throw new InvalidOperationException($"Attempted to finalize array while in state {stateMachine.Current}.");
+                throw new KeyValueException($"Attempted to finalize array while in state {stateMachine.Current} at {tokenReader.TokenStartPosition}.");
             }
 
             stateMachine.PopObject();
-
-            if (stateMachine.IsInObject && !stateMachine.IsInArray)
-            {
-                stateMachine.Push(KV3TextReaderState.InObjectBeforeKey);
-            }
+            SetStateAfterValue();
 
             listener.OnArrayEnd();
         }
@@ -261,35 +298,28 @@ namespace ValveKeyValue.Deserialization.KeyValues3
         {
             stateMachine.GetAndResetFlag();
             stateMachine.SetName(name);
-            stateMachine.Push(KV3TextReaderState.InObjectAfterKey);
+            stateMachine.Set(KV3TextReaderState.InObjectAfterKey);
         }
 
         void BeginNewObject()
         {
-            if (stateMachine.Current != KV3TextReaderState.InArray && stateMachine.Current != KV3TextReaderState.InObjectAfterKey)
-            {
-                throw new InvalidOperationException($"Attempted to begin new object while in state {stateMachine.Current}.");
-            }
+            ThrowIfNotExpectingValue("object");
 
             listener.OnObjectStart(stateMachine.CurrentName, stateMachine.GetAndResetFlag());
 
             stateMachine.PushObject();
-            stateMachine.Push(KV3TextReaderState.InObjectBeforeKey);
+            stateMachine.Set(KV3TextReaderState.InObjectBeforeKey);
         }
 
         void FinalizeCurrentObject(bool @explicit)
         {
             if (stateMachine.Current != KV3TextReaderState.InObjectBeforeKey)
             {
-                throw new InvalidOperationException($"Attempted to finalize object while in state {stateMachine.Current}.");
+                throw new KeyValueException($"Attempted to finalize object while in state {stateMachine.Current} at {tokenReader.TokenStartPosition}.");
             }
 
             stateMachine.PopObject();
-
-            if (stateMachine.IsInObject && !stateMachine.IsInArray)
-            {
-                stateMachine.Push(KV3TextReaderState.InObjectBeforeKey);
-            }
+            SetStateAfterValue();
 
             if (@explicit)
             {
@@ -299,25 +329,28 @@ namespace ValveKeyValue.Deserialization.KeyValues3
 
         void FinalizeDocument()
         {
-            FinalizeCurrentObject(@explicit: true);
-
-            if (stateMachine.IsInObject)
+            if (!stateMachine.IsAtDocumentLevel || stateMachine.Current != KV3TextReaderState.InObjectBeforeKey)
             {
-                throw new InvalidOperationException("Inconsistent state - at end of file whilst inside an object.");
+                throw new KeyValueException($"Found end of file when another token type was expected at {tokenReader.TokenStartPosition}.");
             }
+
+            FinalizeCurrentObject(@explicit: true);
         }
 
-        static KVObject ParseValue(string text)
+        static readonly SearchValues<char> FloatCharacters = SearchValues.Create("+-.0123456789Ee");
+
+        // Parses an unquoted value, returns null when it is not a valid literal.
+        static KVObject? ParseValue(string text)
         {
-            if (text.Equals("false", StringComparison.Ordinal))
+            if (text.Equals("false", StringComparison.OrdinalIgnoreCase))
             {
                 return new KVObject(false);
             }
-            else if (text.Equals("true", StringComparison.Ordinal))
+            else if (text.Equals("true", StringComparison.OrdinalIgnoreCase))
             {
                 return new KVObject(true);
             }
-            else if (text.Equals("null", StringComparison.Ordinal))
+            else if (text.Equals("null", StringComparison.OrdinalIgnoreCase))
             {
                 return KVObject.Null();
             }
@@ -333,36 +366,43 @@ namespace ValveKeyValue.Deserialization.KeyValues3
             {
                 return new KVObject(double.NegativeInfinity);
             }
-            else if (text.Length > 0 && ((text[0] >= '0' && text[0] <= '9') || text[0] == '-' || text[0] == '+'))
+
+            // A lone plus sign is read as zero
+            if (text == "+")
             {
-                // TODO: Due to Valve's string to int/double conversion functions, it is possible to have 0x hex values (as well as prefixed with minus like -0x)
-
-                const NumberStyles IntegerNumberStyles = NumberStyles.AllowLeadingSign;
-
-                if (text[0] == '-' && long.TryParse(text, IntegerNumberStyles, CultureInfo.InvariantCulture, out var intValue))
-                {
-                    return new KVObject(intValue);
-                }
-                else if (ulong.TryParse(text, IntegerNumberStyles, CultureInfo.InvariantCulture, out var uintValue))
-                {
-                    return new KVObject(uintValue);
-                }
-
-                const NumberStyles FloatingPointNumberStyles =
-                    NumberStyles.AllowDecimalPoint |
-                    NumberStyles.AllowExponent |
-                    NumberStyles.AllowLeadingSign;
-
-                if (double.TryParse(text, FloatingPointNumberStyles, CultureInfo.InvariantCulture, out var floatValue))
-                {
-                    return new KVObject(floatValue);
-                }
+                return new KVObject(0UL);
             }
 
-            return new KVObject(text);
+            const NumberStyles IntegerNumberStyles = NumberStyles.AllowLeadingSign;
+
+            if (text[0] == '-' && long.TryParse(text, IntegerNumberStyles, CultureInfo.InvariantCulture, out var intValue))
+            {
+                return new KVObject(intValue);
+            }
+            else if (ulong.TryParse(text, IntegerNumberStyles, CultureInfo.InvariantCulture, out var uintValue))
+            {
+                return new KVObject(uintValue);
+            }
+
+            if (text.AsSpan().ContainsAnyExcept(FloatCharacters))
+            {
+                return null;
+            }
+
+            const NumberStyles FloatingPointNumberStyles =
+                NumberStyles.AllowDecimalPoint |
+                NumberStyles.AllowExponent |
+                NumberStyles.AllowLeadingSign;
+
+            if (double.TryParse(text, FloatingPointNumberStyles, CultureInfo.InvariantCulture, out var floatValue))
+            {
+                return new KVObject(floatValue);
+            }
+
+            return null;
         }
 
-        static KVFlag ParseFlag(string flag)
+        static KVFlag? ParseFlag(string flag)
         {
             if (flag.Equals("resource", StringComparison.OrdinalIgnoreCase)) return KVFlag.Resource;
             if (flag.Equals("resource_name", StringComparison.OrdinalIgnoreCase)) return KVFlag.ResourceName;
@@ -370,7 +410,8 @@ namespace ValveKeyValue.Deserialization.KeyValues3
             if (flag.Equals("soundevent", StringComparison.OrdinalIgnoreCase)) return KVFlag.SoundEvent;
             if (flag.Equals("subclass", StringComparison.OrdinalIgnoreCase)) return KVFlag.SubClass;
             if (flag.Equals("entity_name", StringComparison.OrdinalIgnoreCase)) return KVFlag.EntityName;
-            throw new InvalidDataException($"Unknown flag '{flag}'");
+            if (flag.Equals("localize", StringComparison.OrdinalIgnoreCase)) return KVFlag.Localize;
+            return null;
         }
     }
 }

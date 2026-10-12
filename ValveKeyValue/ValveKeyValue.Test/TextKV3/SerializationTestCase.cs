@@ -109,6 +109,22 @@ namespace ValveKeyValue.Test.TextKV3
         }
 
         [Test]
+        public void SerializesLocalizeFlag()
+        {
+            using var stream = TestDataHelper.OpenResource("TextKV3.localize.kv3");
+            var kv = KVSerializer.Create(KVSerializationFormat.KeyValues3Text);
+            var data = kv.Deserialize(stream);
+
+            var data2 = RoundTrip(kv, data).Root;
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(data2["title"].Flag, Is.EqualTo(KVFlag.Localize));
+                Assert.That((string)data2["title"], Is.EqualTo("#SFUI_Title"));
+            }
+        }
+
+        [Test]
         public void SerializesRootValues()
         {
             var kv = KVSerializer.Create(KVSerializationFormat.KeyValues3Text);
@@ -217,6 +233,30 @@ namespace ValveKeyValue.Test.TextKV3
             {
                 Assert.That((int)data2["i16"], Is.EqualTo(-42));
                 Assert.That((int)data2["u16"], Is.EqualTo(60000));
+            }
+        }
+
+        [TestCase("a\n\"\"\"b\n\"\"\"")]
+        [TestCase("a\nb\\")]
+        [TestCase("a\nb\r")]
+        [TestCase("\\\"\"\"\n")]
+        [TestCase("\n")]
+        [TestCase("42")]
+        [TestCase("true")]
+        [TestCase("null")]
+        [TestCase("-1.5")]
+        public void StringRoundTrips(string value)
+        {
+            var kv = KVSerializer.Create(KVSerializationFormat.KeyValues3Text);
+            var root = KVObject.Collection();
+            root.Add("a", value);
+
+            var data = RoundTrip(kv, new KVDocument(null, null, root)).Root;
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(data["a"].ValueType, Is.EqualTo(KVValueType.String));
+                Assert.That((string)data["a"], Is.EqualTo(value));
             }
         }
 

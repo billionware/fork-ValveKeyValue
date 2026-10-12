@@ -16,7 +16,7 @@ namespace ValveKeyValue.Deserialization.KeyValues1
 
         public bool IsInObject => states.Count > 0;
 
-        public bool IsAtStart => states.Count == 1 && CurrentObject.States.Count == 1 && Current == KV1TextReaderState.InObjectBeforeKey;
+        public bool IsAtDocumentLevel => states.Count == 1;
 
         public void PushObject() => states.Push(new KVPartialState<KV1TextReaderState>());
 
@@ -38,7 +38,7 @@ namespace ValveKeyValue.Deserialization.KeyValues1
 
         public void AddItem(string key, KVObject item) => CurrentObject.Items.Add(new KeyValuePair<string, KVObject>(key, item));
 
-        public void SetDiscardCurrent() => CurrentObject.Discard = true;
+        public void SetDiscardCurrent(bool discard) => CurrentObject.Discard = discard;
 
         public IEnumerable<string> ItemsForMerging => includedPathsToMerge;
 

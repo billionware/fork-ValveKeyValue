@@ -10,7 +10,7 @@ namespace ValveKeyValue.Deserialization.KeyValues1
         const char CommentBegin = '/'; // Although Valve uses the double-slash convention, the KV spec allows for single-slash comments.
         const char ConditionBegin = '[';
         const char ConditionEnd = ']';
-        const char InclusionMark = '#';
+        const char Assignment = '=';
 
         public KV1TokenReader(TextReader textReader, KVSerializerOptions options) : base(textReader)
         {
@@ -21,6 +21,22 @@ namespace ValveKeyValue.Deserialization.KeyValues1
 
         readonly StringBuilder sb = new();
         readonly KVSerializerOptions options;
+
+        // Whether a backslash-quote (\") was read while escape sequences were disabled. If parsing
+        // subsequently fails, this is the likely cause, and the error message suggests enabling them.
+        bool encounteredPossibleEscapeSequence;
+
+        // Creates the exception for a syntax error. Messages carry their own precise position;
+        // the escape-sequences hint is appended when a stray \" suggests the file needs it.
+        public KeyValueException MakeSyntaxException(string message, Exception? innerException = null)
+        {
+            if (encounteredPossibleEscapeSequence)
+            {
+                message += " A backslash-escaped quotation mark (\\\") was read, but escape sequences are disabled - consider enabling KVSerializerOptions.HasEscapeSequences.";
+            }
+
+            return new KeyValueException(message, innerException);
+        }
 
         protected override KVToken ReadNextTokenInner()
         {
@@ -36,15 +52,16 @@ namespace ValveKeyValue.Deserialization.KeyValues1
                 ObjectEnd => ReadObjectEnd(),
                 CommentBegin => ReadComment(),
                 ConditionBegin => ReadCondition(),
-                InclusionMark => ReadInclusion(),
-                _ => ReadString(),
+                Assignment => ReadAssignment(),
+                QuotationMark => new KVToken(KVTokenType.String, ReadQuotedString()),
+                _ => new KVToken(KVTokenType.String, ReadUnquotedString()),
             };
         }
 
-        KVToken ReadString()
+        KVToken ReadAssignment()
         {
-            var text = ReadStringRaw();
-            return new KVToken(KVTokenType.String, text);
+            ReadChar(Assignment);
+            return new KVToken(KVTokenType.Assignment, "=");
         }
 
         KVToken ReadObjectStart()
@@ -63,29 +80,26 @@ namespace ValveKeyValue.Deserialization.KeyValues1
         {
             ReadChar(CommentBegin);
 
-            // Some keyvalues implementations have a bug where only a single slash is needed for a comment
-            // If the file ends with a single slash then we have an empty comment, bail out
-            if (!TryGetNext(out var next))
+            // Some keyvalues implementations have a bug where only a single slash is needed for a comment.
+            // Otherwise the second slash is part of the comment marker.
+            if (Peek() == CommentBegin)
             {
-                return new KVToken(KVTokenType.Comment, string.Empty);
+                Next();
             }
 
-            // If the next character is not a slash, then we have a comment that starts with a single slash
-            // Otherwise pretend the comment is a double-slash and ignore this new second slash.
-            if (next != CommentBegin)
-            {
-                sb.Append(next);
-            }
+            // The comment ends at the line break, which is left for the whitespace between tokens.
+            // A carriage return before it is not part of the comment either.
+            MarkTokenEnd();
 
-            // Be more permissive here than in other places, as comments can be the last token in a file.
-            while (TryGetNext(out next))
+            int next;
+            while (!IsEndOfFile(next = Peek()) && next != '\n')
             {
-                if (next == '\n')
+                sb.Append(Next());
+
+                if (next != '\r')
                 {
-                    break;
+                    MarkTokenEnd();
                 }
-
-                sb.Append(next);
             }
 
             if (sb.Length > 0 && sb[^1] == '\r')
@@ -99,36 +113,29 @@ namespace ValveKeyValue.Deserialization.KeyValues1
             return new KVToken(KVTokenType.Comment, text);
         }
 
+        // Conditionals are not quoted, so escape sequences are not translated inside them.
         KVToken ReadCondition()
         {
             ReadChar(ConditionBegin);
-            var text = ReadUntil(static (c) => c == ConditionEnd);
+
+            while (Peek() != ConditionEnd)
+            {
+                sb.Append(Next());
+            }
+
             ReadChar(ConditionEnd);
 
+            var text = sb.ToString();
+            sb.Clear();
+
             return new KVToken(KVTokenType.Condition, text);
-        }
-
-        KVToken ReadInclusion()
-        {
-            ReadChar(InclusionMark);
-            var term = ReadUntil(static c => c is ' ' or '\t');
-            var value = ReadStringRaw();
-
-            if (string.Equals(term, "include", StringComparison.Ordinal))
-            {
-                return new KVToken(KVTokenType.IncludeAndAppend, value);
-            }
-            else if (string.Equals(term, "base", StringComparison.Ordinal))
-            {
-                return new KVToken(KVTokenType.IncludeAndMerge, value);
-            }
-
-            throw new InvalidDataException($"Unrecognized term after '#' symbol (line {Line}, column {Column})");
         }
 
         string ReadUntil(Func<int, bool> isTerminator)
         {
             var escapeNext = false;
+            var escapeLine = 0;
+            var escapeColumn = 0;
 
             while (escapeNext || !isTerminator(Peek()))
             {
@@ -139,6 +146,9 @@ namespace ValveKeyValue.Deserialization.KeyValues1
                     if (!escapeNext && next == '\\')
                     {
                         escapeNext = true;
+                        // Only the backslash has been consumed, so it sits one column back on this line.
+                        escapeLine = Line;
+                        escapeColumn = Column - 1;
                         continue;
                     }
 
@@ -158,11 +168,15 @@ namespace ValveKeyValue.Deserialization.KeyValues1
                             '\'' => '\'',
                             '"' => '"',
                             _ when options.EnableValveNullByteBugBehavior => '\0',
-                            _ => throw new InvalidDataException($"Unknown escape sequence '\\{next}' at line {Line}, column {Column - 2}."),
+                            _ => throw MakeSyntaxException($"Unknown escape sequence '\\{next}' at line {escapeLine}, column {escapeColumn}."),
                         };
 
                         escapeNext = false;
                     }
+                }
+                else if (next == '\\' && Peek() == QuotationMark)
+                {
+                    encounteredPossibleEscapeSequence = true;
                 }
 
                 sb.Append(next);
@@ -180,12 +194,13 @@ namespace ValveKeyValue.Deserialization.KeyValues1
             return result;
         }
 
-        string ReadUntilWhitespaceOrQuote()
+        // An unquoted string ends at whitespace, a quotation mark, a brace, or '='.
+        string ReadUnquotedString()
         {
             while (true)
             {
                 var next = Peek();
-                if (next == -1 || char.IsWhiteSpace((char)next) || next == '"')
+                if (IsEndOfFile(next) || char.IsWhiteSpace((char)next) || next is QuotationMark or ObjectStart or ObjectEnd or Assignment)
                 {
                     break;
                 }
@@ -199,20 +214,7 @@ namespace ValveKeyValue.Deserialization.KeyValues1
             return result;
         }
 
-        string ReadStringRaw()
-        {
-            SwallowWhitespace();
-            if (Peek() == '"')
-            {
-                return ReadQuotedStringRaw();
-            }
-            else
-            {
-                return ReadUntilWhitespaceOrQuote();
-            }
-        }
-
-        string ReadQuotedStringRaw()
+        string ReadQuotedString()
         {
             ReadChar(QuotationMark);
             var text = ReadUntil(static (c) => c == QuotationMark);

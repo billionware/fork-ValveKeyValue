@@ -1,5 +1,3 @@
-﻿using System.Linq;
-
 namespace ValveKeyValue
 {
     /// <summary>
@@ -11,7 +9,7 @@ namespace ValveKeyValue
         /// Initializes a new instance of the <see cref="StringTable"/> class.
         /// </summary>
         public StringTable()
-            : this(new List<string>(), writable: true)
+            : this([], writable: true)
         {
         }
 
@@ -47,7 +45,6 @@ namespace ValveKeyValue
             }
         }
 
-
         readonly IList<string> lookup;
         readonly bool writable;
         readonly Dictionary<string, int> reverse;
@@ -61,15 +58,8 @@ namespace ValveKeyValue
         {
             get
             {
-                if (index < 0)
-                {
-                    throw new ArgumentOutOfRangeException(nameof(index), "Index must be non-negative.");
-                }
-
-                if (index >= lookup.Count)
-                {
-                    throw new ArgumentOutOfRangeException(nameof(index), index, "Index must be less than the number of strings in the table.");
-                }
+                ArgumentOutOfRangeException.ThrowIfNegative(index);
+                ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(index, lookup.Count);
 
                 return lookup[index];
             }
@@ -110,6 +100,6 @@ namespace ValveKeyValue
         /// Converts the string table to an array.
         /// </summary>
         /// <returns>An array of strings.</returns>
-        public string[] ToArray() => lookup.ToArray();
+        public string[] ToArray() => [.. lookup];
     }
 }

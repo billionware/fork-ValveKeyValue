@@ -43,6 +43,10 @@ namespace ValveKeyValue
                 {
                     throw new InvalidOperationException($"Cannot deserialize a non-array value to type \"{typeof(TObject).Namespace}.{typeof(TObject).Name}\".");
                 }
+                else if (typeof(IEnumerable).IsAssignableFrom(typeof(TObject)))
+                {
+                    throw new NotSupportedException($"Cannot deserialize to enumerable type {typeof(TObject).Name}.");
+                }
 
                 // The object must remain boxed until it is fully initiallized, as this is the only way
                 // that we can build a struct due to the nature of struct copying.
@@ -74,7 +78,7 @@ namespace ValveKeyValue
         public static KVObject FromObject(
             [DynamicallyAccessedMembers(Trimming.Properties)] Type objectType,
             object managedObject)
-            => ConvertObjectToValue(objectType, managedObject, new DefaultObjectReflector(), new HashSet<object>());
+            => ConvertObjectToValue(objectType, managedObject, new DefaultObjectReflector(), new HashSet<object>(ReferenceEqualityComparer.Instance));
 
         [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2072", Justification = "If the IDictionary's value object already exists at runtime then its properties will too.")]
         static KVObject ConvertObjectToValue(
@@ -83,6 +87,15 @@ namespace ValveKeyValue
             IObjectReflector reflector,
             HashSet<object> visitedObjects)
         {
+            switch (managedObject)
+            {
+                case KVObject kvObject:
+                    return kvObject;
+
+                case KVDocument document:
+                    return document.Root;
+            }
+
             if (!objectType.IsValueType && objectType != typeof(string) && !visitedObjects.Add(managedObject))
             {
                 throw new KeyValueException("Serialization failed - circular object reference detected.");
@@ -105,7 +118,7 @@ namespace ValveKeyValue
                     var entry = enumerator.Entry;
 
                     var childObjectValue = ConvertObjectToValue(entry.Value!.GetType(), entry.Value, reflector, visitedObjects);
-                    childItems.Add(new KeyValuePair<string, KVObject>(entry.Key.ToString()!, childObjectValue));
+                    childItems.Add(new KeyValuePair<string, KVObject>(Convert.ToString(entry.Key, CultureInfo.InvariantCulture)!, childObjectValue));
                 }
             }
             else if (objectType == typeof(byte[]))
@@ -150,7 +163,7 @@ namespace ValveKeyValue
 
             foreach (var (key, child) in kv)
             {
-                if (!members.TryGetValue(key, out var member))
+                if (!members.TryGetValue(key, out var member) || !member.CanWrite)
                 {
                     continue;
                 }
@@ -426,10 +439,52 @@ namespace ValveKeyValue
                     return kvObject.AsBlob();
                 }
 
+                if (valueType.IsEnum)
+                {
+                    return ConvertToEnum(kvObject, valueType);
+                }
+
                 return Convert.ChangeType(kvObject.ToType(valueType, null), valueType, CultureInfo.InvariantCulture);
             }
 
+            if (valueType.IsEnum)
+            {
+                return ConvertToEnum(value, valueType);
+            }
+
             return Convert.ChangeType(value, valueType, CultureInfo.InvariantCulture);
+        }
+
+        // Converts a scalar value to an enum. Strings (including dictionary keys) are parsed as
+        // either a number or case-insensitive member names, comma-separated for flags. Other
+        // values are converted through the enum's underlying type.
+        static object ConvertToEnum(object value, Type enumType)
+        {
+            if (value is KVObject { ValueType: not KVValueType.String } kvObject)
+            {
+                var underlyingType = Enum.GetUnderlyingType(enumType);
+                object underlyingValue;
+
+                try
+                {
+                    underlyingValue = kvObject.ToType(underlyingType, CultureInfo.InvariantCulture);
+                }
+                catch (Exception e)
+                {
+                    throw new NotSupportedException($"Conversion to {enumType} failed. (type = {kvObject.ValueType})", e);
+                }
+
+                return Enum.ToObject(enumType, underlyingValue);
+            }
+
+            var text = Convert.ToString(value, CultureInfo.InvariantCulture)!;
+
+            if (!Enum.TryParse(enumType, text, ignoreCase: true, out var result))
+            {
+                throw new NotSupportedException($"Conversion to {enumType} failed, \"{text}\" is not a valid value.");
+            }
+
+            return result;
         }
 
         static bool TryConvertValueTo<TValue>(KVObject value, [MaybeNullWhen(false)] out TValue converted)
@@ -450,9 +505,7 @@ namespace ValveKeyValue
 
             if (targetType.IsEnum)
             {
-                var underlyingType = Enum.GetUnderlyingType(targetType);
-                var underlyingValue = value.ToType(underlyingType, CultureInfo.InvariantCulture);
-                converted = (TValue)Enum.ToObject(targetType, underlyingValue);
+                converted = (TValue)ConvertToEnum(value, targetType);
                 return true;
             }
 
@@ -509,6 +562,8 @@ namespace ValveKeyValue
             return Type.GetTypeCode(type) switch
             {
                 TypeCode.Boolean => new KVObject((bool)value),
+                TypeCode.Char => new KVObject(((char)value).ToString()),
+                TypeCode.Decimal => new KVObject((double)(decimal)value),
                 TypeCode.Byte => new KVObject((int)(byte)value),
                 TypeCode.SByte => new KVObject((int)(sbyte)value),
                 TypeCode.Int16 => new KVObject((int)(short)value),

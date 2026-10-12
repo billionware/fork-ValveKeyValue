@@ -77,6 +77,24 @@ namespace ValveKeyValue.Test
         }
 
         [Test]
+        public void Kv3ParserSpansForFlagsAndUnquotedValues()
+        {
+            const string text = TestDataHelper.KV3Header + "{\n\ta = resource : \"x\"\n\tb = -5   \n\tc = panorama|\"y\"\n}\n";
+
+            var (doc, spans) = KVSerializer.Create(KVSerializationFormat.KeyValues3Text)
+                .DeserializeWithSourceMap(text);
+
+            Assert.That(doc["a"].Flag, Is.EqualTo(KVFlag.Resource));
+
+            AssertSpansAreWellFormed(text, spans);
+            AssertSpanExists(text, spans, KVTokenType.Key, "a");
+            AssertSpanExists(text, spans, KVTokenType.Flag, "resource :");
+            AssertSpanExists(text, spans, KVTokenType.String, "\"x\"");
+            AssertSpanExists(text, spans, KVTokenType.Identifier, "-5");
+            AssertSpanExists(text, spans, KVTokenType.Flag, "panorama|");
+        }
+
+        [Test]
         public void Kv1SerializerSpansLineUpWithEmittedText()
         {
             var root = KVObject.ListCollection();
@@ -142,6 +160,17 @@ namespace ValveKeyValue.Test
             Assert.That(spans.Any(s => s.TokenType == KVTokenType.ObjectEnd && text[s.Start] == '}'), Is.True);
         }
 
+        [Test]
+        public void DocumentWithNameSerializesItsRoot()
+        {
+            var kv = KVSerializer.Create(KVSerializationFormat.KeyValues1Text);
+            var (document, _) = kv.DeserializeWithSourceMap("\"original\"\n{\n\t\"a\"\t\"1\"\n}\n");
+
+            var (text, _) = kv.SerializeWithSourceMap(document, "renamed");
+
+            Assert.That(text, Is.EqualTo("\"renamed\"\n{\n\t\"a\"\t\"1\"\n}\n"));
+        }
+
         class Person
         {
             public required string FirstName { get; set; }
@@ -169,6 +198,54 @@ namespace ValveKeyValue.Test
 
             Assert.That(spans.Any(s => s.TokenType == KVTokenType.ObjectStart && text[s.Start] == '{'), Is.True);
             Assert.That(spans.Any(s => s.TokenType == KVTokenType.ObjectEnd && text[s.Start] == '}'), Is.True);
+        }
+
+        [Test]
+        public void Kv1ParserSpansForAssignmentsAndUnquotedTokens()
+        {
+            const string text = "#base \"base.vdf\"\r\n\"root\"\r\n{\r\n\tkey=value\r\n\t\"b\" = [$WIN32] \"2\" // c\r\n\tc={d 1}\r\n\te==\r\n}\r\n";
+
+            var options = new KVSerializerOptions { FileLoader = new EmptyIncludedFileLoader() };
+            var (doc, spans) = KVSerializer.Create(KVSerializationFormat.KeyValues1Text)
+                .DeserializeWithSourceMap(text, options);
+
+            Assert.That((string)doc["key"], Is.EqualTo("value"));
+
+            AssertSpansAreWellFormed(text, spans);
+
+            // A skipped '=' is an Assignment, while an '=' read as a value is a String.
+            var expected = new (KVTokenType, string)[]
+            {
+                (KVTokenType.IncludeAndMerge, "#base"),
+                (KVTokenType.String, "\"base.vdf\""),
+                (KVTokenType.Key, "\"root\""),
+                (KVTokenType.ObjectStart, "{"),
+                (KVTokenType.Key, "key"),
+                (KVTokenType.Assignment, "="),
+                (KVTokenType.String, "value"),
+                (KVTokenType.Key, "\"b\""),
+                (KVTokenType.Assignment, "="),
+                (KVTokenType.Condition, "[$WIN32]"),
+                (KVTokenType.String, "\"2\""),
+                (KVTokenType.Comment, "// c"),
+                (KVTokenType.Key, "c"),
+                (KVTokenType.Assignment, "="),
+                (KVTokenType.ObjectStart, "{"),
+                (KVTokenType.Key, "d"),
+                (KVTokenType.String, "1"),
+                (KVTokenType.ObjectEnd, "}"),
+                (KVTokenType.Key, "e"),
+                (KVTokenType.Assignment, "="),
+                (KVTokenType.String, "="),
+                (KVTokenType.ObjectEnd, "}"),
+            };
+
+            Assert.That(spans.Select(s => (s.TokenType, text[s.Start..s.End])), Is.EqualTo(expected));
+        }
+
+        sealed class EmptyIncludedFileLoader : IIncludedFileLoader
+        {
+            Stream IIncludedFileLoader.OpenFile(string filePath) => new MemoryStream("\"base\" { }"u8.ToArray());
         }
 
         // Asserts the universal source-map invariants: spans lie within the text, are non-empty,

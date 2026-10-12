@@ -16,7 +16,7 @@ namespace ValveKeyValue.Deserialization.KeyValues1
 
             if (!stream.CanSeek)
             {
-                throw new ArgumentException("Stream must be seekable", nameof(stream));
+                throw new ArgumentException("Stream must be seekable.", nameof(stream));
             }
 
             this.stream = stream;
@@ -41,19 +41,19 @@ namespace ValveKeyValue.Deserialization.KeyValues1
 
             try
             {
-                ReadObjectCore();
+                ReadRootObject();
             }
             catch (IOException ex)
             {
-                throw new KeyValueException("Error while reading binary KeyValues.", ex);
+                throw new KeyValueException($"Error while reading binary KeyValues at offset {stream.Position}.", ex);
             }
             catch (ArgumentOutOfRangeException ex)
             {
-                throw new KeyValueException("Error while parsing binary KeyValues.", ex);
+                throw new KeyValueException($"Error while parsing binary KeyValues at offset {stream.Position}.", ex);
             }
             catch (NotSupportedException ex)
             {
-                throw new KeyValueException("Error while parsing binary KeyValues.", ex);
+                throw new KeyValueException($"Error while parsing binary KeyValues at offset {stream.Position}.", ex);
             }
 
             return new KVHeader();
@@ -65,6 +65,23 @@ namespace ValveKeyValue.Deserialization.KeyValues1
             {
                 reader.Dispose();
                 disposed = true;
+            }
+        }
+
+        void ReadRootObject()
+        {
+            var type = ReadNextNodeType();
+
+            if (type == endMarker)
+            {
+                return;
+            }
+
+            ReadValue(type);
+
+            if (ReadNextNodeType() != endMarker)
+            {
+                throw new KeyValueException($"Found data after the root object at offset {stream.Position}, documents with multiple root objects are not supported.");
             }
         }
 

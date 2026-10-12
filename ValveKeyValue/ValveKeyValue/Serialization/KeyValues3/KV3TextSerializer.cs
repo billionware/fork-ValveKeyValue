@@ -2,12 +2,15 @@ using System.Buffers;
 using System.Globalization;
 using System.Text;
 using ValveKeyValue.Abstraction;
+using ValveKeyValue.Deserialization.KeyValues3;
 
 namespace ValveKeyValue.Serialization.KeyValues3
 {
     sealed class KV3TextSerializer : KVTextSerializerBase, IVisitationListener
     {
         static readonly SearchValues<char> CharsToEscape = SearchValues.Create("\n\t\\\"");
+        static readonly ValveKeyValue.KeyValues3.KV3ID TextEncoding = new("text", ValveKeyValue.KeyValues3.Encoding.Text);
+        static readonly ValveKeyValue.KeyValues3.KV3ID GenericFormat = new("generic", ValveKeyValue.KeyValues3.Format.Generic);
 
         public KV3TextSerializer(Stream stream, KVHeader? header = null, bool skipHeader = false)
             : base(stream)
@@ -28,14 +31,11 @@ namespace ValveKeyValue.Serialization.KeyValues3
                 return;
             }
 
-            var defaultEncoding = new ValveKeyValue.KeyValues3.KV3ID("text", ValveKeyValue.KeyValues3.Encoding.Text);
-            var defaultFormat = new ValveKeyValue.KeyValues3.KV3ID("generic", ValveKeyValue.KeyValues3.Format.Generic);
+            var format = header?.Format.Name != null ? header.Format : GenericFormat;
 
-            var encoding = header?.Encoding.Name != null ? header.Encoding : defaultEncoding;
-            var format = header?.Format.Name != null ? header.Format : defaultFormat;
-
+            // The output is always text, whatever encoding the document was read from
             var s = Position;
-            writer.Write($"<!-- kv3 encoding:{encoding} format:{format} -->");
+            writer.Write($"<!-- kv3 encoding:{TextEncoding} format:{format} -->");
             Record(s, KVTokenType.Header);
             writer.WriteLine();
         }
@@ -171,9 +171,9 @@ namespace ValveKeyValue.Serialization.KeyValues3
 
             WriteFlag(flag);
 
-            // After "key = " or "key = flag:", put bracket on next line.
-            // Also for flagged object elements.
-            if ((name != null || flag != KVFlag.None) && indentation > 0)
+            // After "key = " or "flag:", put bracket on next line.
+            // Also for flagged object elements and a flagged root.
+            if ((name != null && indentation > 0) || flag != KVFlag.None)
             {
                 writer.WriteLine();
                 WriteIndentation();
@@ -389,7 +389,8 @@ namespace ValveKeyValue.Serialization.KeyValues3
 
         void WriteText(string text)
         {
-            if (text.Contains('\n', StringComparison.Ordinal))
+            // A trailing backslash or carriage return would merge with the newline before the closing """
+            if (text.Contains('\n', StringComparison.Ordinal) && !text.EndsWith('\\') && !text.EndsWith('\r'))
             {
                 text = text.Replace("\r\n", "\n", StringComparison.Ordinal);
                 text = text.Replace("\"\"\"", "\\\"\"\"", StringComparison.Ordinal);
@@ -398,20 +399,30 @@ namespace ValveKeyValue.Serialization.KeyValues3
                 writer.Write(text);
                 writer.Write("\n\"\"\"");
             }
-            else if (!text.AsSpan().ContainsAny(CharsToEscape))
+            else
             {
-                writer.Write('"');
+                WriteQuoted(text);
+            }
+        }
+
+        void WriteQuoted(string text)
+        {
+            writer.Write('"');
+
+            if (!text.AsSpan().ContainsAny(CharsToEscape))
+            {
                 writer.Write(text);
-                writer.Write('"');
             }
             else
             {
-                writer.Write('"');
-
                 foreach (var @char in text)
                 {
                     switch (@char)
                     {
+                        case '\n':
+                            writer.Write("\\n");
+                            break;
+
                         case '\t':
                             writer.Write("\\t");
                             break;
@@ -429,9 +440,9 @@ namespace ValveKeyValue.Serialization.KeyValues3
                             break;
                     }
                 }
-
-                writer.Write('"');
             }
+
+            writer.Write('"');
         }
 
         void WriteKey(string? key)
@@ -443,45 +454,13 @@ namespace ValveKeyValue.Serialization.KeyValues3
 
             var s = Position;
 
-            if (key.Length > 0 && !char.IsAsciiDigit(key[0]) && !NeedsQuoting(key))
+            if (KV3TokenReader.IsIdentifier(key))
             {
                 writer.Write(key);
             }
             else
             {
-                writer.Write('"');
-
-                foreach (var @char in key)
-                {
-                    switch (@char)
-                    {
-                        case '\t':
-                            writer.Write("\\t");
-                            break;
-
-                        case '\n':
-                            writer.Write("\\n");
-                            break;
-
-                        case '\'':
-                            writer.Write("\\'");
-                            break;
-
-                        case '"':
-                            writer.Write("\\\"");
-                            break;
-
-                        case '\\':
-                            writer.Write("\\\\");
-                            break;
-
-                        default:
-                            writer.Write(@char);
-                            break;
-                    }
-                }
-
-                writer.Write('"');
+                WriteQuoted(key);
             }
 
             Record(s, KVTokenType.Key);
@@ -491,19 +470,6 @@ namespace ValveKeyValue.Serialization.KeyValues3
             writer.Write(' ');
         }
 
-        static bool NeedsQuoting(string key)
-        {
-            foreach (var c in key)
-            {
-                if (c != '.' && c != '_' && !char.IsAsciiLetterOrDigit(c))
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
         void WriteFlag(KVFlag kvFlag)
         {
             if (kvFlag == KVFlag.None)
@@ -511,7 +477,7 @@ namespace ValveKeyValue.Serialization.KeyValues3
                 return;
             }
 
-            var name = SerializeFlagName(kvFlag);
+            var name = kvFlag.SerializeFlagName();
 
             if (name != null)
             {
@@ -525,20 +491,6 @@ namespace ValveKeyValue.Serialization.KeyValues3
         void WriteLine()
         {
             writer.WriteLine();
-        }
-
-        static string? SerializeFlagName(KVFlag flag)
-        {
-            return flag switch
-            {
-                KVFlag.Resource => "resource",
-                KVFlag.ResourceName => "resource_name",
-                KVFlag.Panorama => "panorama",
-                KVFlag.SoundEvent => "soundevent",
-                KVFlag.SubClass => "subclass",
-                KVFlag.EntityName => "entity_name",
-                _ => null,
-            };
         }
     }
 }

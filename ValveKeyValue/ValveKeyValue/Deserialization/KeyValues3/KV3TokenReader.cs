@@ -17,7 +17,7 @@ namespace ValveKeyValue.Deserialization.KeyValues3
         const char Comma = ',';
 
         // Dota 2 binary from 2017 used "+" as a terminate (for flagged values), but then they changed it to "|"
-        static readonly SearchValues<char> TokenTerminators = SearchValues.Create("{}[]=, \t\n\r'\":|;");
+        static readonly SearchValues<char> TokenTerminators = SearchValues.Create("{}[]=,'\":|;");
 
         readonly StringBuilder sb = new();
 
@@ -85,12 +85,9 @@ namespace ValveKeyValue.Deserialization.KeyValues3
 
         KVToken ReadStringOrIdentifier()
         {
-            SwallowWhitespace();
-
             // The token type follows what the source actually looks like, not the contents:
-            // a quoted token is always String (so "42" stays a String for the source map),
-            // an unquoted identifier-shaped token is Identifier, and an unquoted token with
-            // a trailing : or | is a Flag.
+            // a quoted token is always String (so "42" stays a string), any other token is
+            // Identifier, and an identifier-shaped token followed by : or | is a Flag.
             var first = Peek();
             var isQuoted = first == '"' || first == '\'';
 
@@ -101,15 +98,25 @@ namespace ValveKeyValue.Deserialization.KeyValues3
                 return new KVToken(KVTokenType.String, token);
             }
 
-            var type = IsIdentifier(token) ? KVTokenType.Identifier : KVTokenType.String;
-
-            if (type == KVTokenType.Identifier)
+            if (token.Length == 0)
             {
+                throw new KeyValueException($"The syntax is incorrect, unexpected character '{(char)first}' at {TokenStartPosition}.");
+            }
+
+            var type = KVTokenType.Identifier;
+
+            if (IsIdentifier(token))
+            {
+                // Whitespace is allowed between a flag and its separator
+                MarkTokenEnd();
+                SwallowWhitespace();
+
                 var next = Peek();
 
                 if (next == ':' || next == '|')
                 {
                     Next();
+                    MarkTokenEnd();
                     type = KVTokenType.Flag;
                 }
             }
@@ -120,23 +127,38 @@ namespace ValveKeyValue.Deserialization.KeyValues3
         KVToken ReadBinaryBlob()
         {
             ReadChar(BinaryBlobMarker);
-            ReadChar(ArrayStart); // TODO: Strictly speaking Valve allows bare # without [ to be read as literal value (but what would that be?)
 
+            // The marker is a token of its own, so it cannot be followed directly by more token characters
+            if (IsUnquotedTokenChar(Peek()))
+            {
+                throw new KeyValueException($"The syntax is incorrect, expected '[' after '#' at {TokenStartPosition}.");
+            }
+
+            SwallowWhitespaceAndComments();
+            ReadChar(ArrayStart);
+
+            // Each byte is a separate token of exactly two hexadecimal digits
             while (true)
             {
-                var next = Next();
+                SwallowWhitespaceAndComments();
 
-                if (char.IsWhiteSpace(next))
+                if (Peek() == ArrayEnd)
                 {
-                    continue;
-                }
-
-                if (next == ArrayEnd)
-                {
+                    Next();
                     break;
                 }
 
-                sb.Append(next);
+                var start = sb.Length;
+
+                while (IsUnquotedTokenChar(Peek()))
+                {
+                    sb.Append(Next());
+                }
+
+                if (sb.Length - start != 2)
+                {
+                    throw new KeyValueException($"Invalid binary blob at {TokenStartPosition}, expected bytes as pairs of hexadecimal digits separated by whitespace.");
+                }
             }
 
             var result = sb.ToString();
@@ -144,87 +166,44 @@ namespace ValveKeyValue.Deserialization.KeyValues3
             return new KVToken(KVTokenType.BinaryBlob, result);
         }
 
+        // Whitespace and comments are allowed between any of the header tokens
         public KVHeader ReadHeader()
         {
-            var str = ReadToken();
+            ExpectHeaderToken("<!--");
+            ExpectHeaderToken("kv3");
+            ExpectHeaderToken("encoding");
+            ExpectHeaderChar(':');
+            var encodingType = ReadHeaderName();
+            ExpectHeaderChar(':');
+            ExpectHeaderToken("version");
+            ExpectHeaderChar('{');
+            var encoding = ReadVersionGuid();
+            ExpectHeaderChar('}');
 
-            if (str != "<!--")
+            ExpectHeaderToken("format");
+            ExpectHeaderChar(':');
+            var formatType = ReadHeaderName();
+            ExpectHeaderChar(':');
+            ExpectHeaderToken("version");
+            ExpectHeaderChar('{');
+            var format = ReadVersionGuid();
+            ExpectHeaderChar('}');
+
+            ExpectHeaderToken("-->");
+
+            if (!encodingType.Equals("text", StringComparison.OrdinalIgnoreCase))
             {
-                throw new InvalidDataException($"The header is incorrect, expected '<!--' but got '{str}'.");
+                throw new KeyValueException($"Unrecognized encoding, expected 'text' but got '{encodingType}'.");
             }
 
-            SwallowWhitespace();
-            str = ReadToken();
-
-            if (!str.Equals("kv3", StringComparison.OrdinalIgnoreCase))
+            if (encoding != Encoding.Text)
             {
-                throw new InvalidDataException($"The header is incorrect, expected 'kv3' but got '{str}'.");
-            }
-
-            SwallowWhitespace();
-            str = ReadToken();
-
-            if (!str.Equals("encoding", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidDataException($"The header is incorrect, expected 'encoding' but got '{str}'.");
-            }
-
-            ReadChar(':');
-            var encodingType = ReadToken();
-            ReadChar(':');
-
-            str = ReadToken();
-
-            if (!str.Equals("version", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidDataException($"The header is incorrect, expected 'version' but got '{str}'.");
-            }
-
-            ReadChar('{');
-            var encoding = new Guid(ReadToken());
-            ReadChar('}');
-
-            SwallowWhitespace();
-
-            str = ReadToken();
-
-            if (!str.Equals("format", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidDataException($"The header is incorrect, expected 'format' but got '{str}'.");
-            }
-
-            ReadChar(':');
-            var formatType = ReadToken();
-            ReadChar(':');
-
-            str = ReadToken();
-
-            if (!str.Equals("version", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidDataException($"The header is incorrect, expected 'version' but got '{str}'.");
-            }
-
-            ReadChar('{');
-            var format = new Guid(ReadToken());
-            ReadChar('}');
-
-            SwallowWhitespace();
-
-            str = ReadToken();
-
-            if (str != "-->")
-            {
-                throw new InvalidDataException($"The header is incorrect, expected '-->' but got '{str}'.");
-            }
-
-            if (encodingType.Equals("text", StringComparison.OrdinalIgnoreCase) && encoding != Encoding.Text)
-            {
-                throw new InvalidDataException($"Unrecognized encoding version, expected '{Encoding.Text}' but got '{encoding}'.");
+                throw new KeyValueException($"Unrecognized encoding version, expected '{Encoding.Text}' but got '{encoding}'.");
             }
 
             if (formatType.Equals("generic", StringComparison.OrdinalIgnoreCase) && format != Format.Generic)
             {
-                throw new InvalidDataException($"Unrecognized format version, expected '{Format.Generic}' but got '{format}'.");
+                throw new KeyValueException($"Unrecognized format version, expected '{Format.Generic}' but got '{format}'.");
             }
 
             return new KVHeader
@@ -234,7 +213,76 @@ namespace ValveKeyValue.Deserialization.KeyValues3
             };
         }
 
+        // Header tokens are never quoted
+        string ReadHeaderToken()
+        {
+            SwallowWhitespaceAndComments();
+            MarkTokenStart();
+            return ReadUnquotedToken();
+        }
+
+        string ReadHeaderName()
+        {
+            var str = ReadHeaderToken();
+
+            if (!IsIdentifier(str))
+            {
+                throw new KeyValueException($"The header is incorrect, expected a name but got '{str}' at {TokenStartPosition}.");
+            }
+
+            return str;
+        }
+
+        void ExpectHeaderToken(string expected)
+        {
+            var str = ReadHeaderToken();
+
+            if (!str.Equals(expected, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new KeyValueException($"The header is incorrect, expected '{expected}' but got '{str}' at {TokenStartPosition}.");
+            }
+        }
+
+        void ExpectHeaderChar(char expected)
+        {
+            SwallowWhitespaceAndComments();
+            ReadChar(expected);
+        }
+
+        Guid ReadVersionGuid()
+        {
+            var str = ReadHeaderToken();
+
+            if (!Guid.TryParse(str, out var guid))
+            {
+                throw new KeyValueException($"The header is incorrect, expected a version GUID but got '{str}' at {TokenStartPosition}.");
+            }
+
+            return guid;
+        }
+
         KVToken ReadComment()
+        {
+            SkipComment();
+            return new KVToken(KVTokenType.Comment);
+        }
+
+        void SwallowWhitespaceAndComments()
+        {
+            while (true)
+            {
+                SwallowWhitespace();
+
+                if (Peek() != CommentBegin)
+                {
+                    break;
+                }
+
+                SkipComment();
+            }
+        }
+
+        void SkipComment()
         {
             ReadChar(CommentBegin);
 
@@ -246,7 +294,7 @@ namespace ValveKeyValue.Deserialization.KeyValues3
                 {
                     if (IsEndOfFile(Peek()))
                     {
-                        throw new InvalidDataException("Unterminated block comment.");
+                        throw new KeyValueException($"Unterminated block comment starting at {TokenStartPosition}.");
                     }
 
                     next = Next();
@@ -260,56 +308,60 @@ namespace ValveKeyValue.Deserialization.KeyValues3
             }
             else if (next == CommentBegin)
             {
+                // A backslash at the end of the line continues the comment onto the next line
+                var previous = '\0';
+                var beforePrevious = '\0';
+
                 while (true)
                 {
                     var peek = Peek();
 
-                    if (IsEndOfFile(peek) || peek == '\n')
+                    if (IsEndOfFile(peek))
                     {
                         break;
                     }
 
-                    Next();
+                    if (peek == '\n' && previous != '\\' && (previous != '\r' || beforePrevious != '\\'))
+                    {
+                        break;
+                    }
+
+                    beforePrevious = previous;
+                    previous = Next();
                 }
             }
             else
             {
-                throw new InvalidDataException($"The syntax is incorrect, expected comment but got '/{next}'.");
+                throw new KeyValueException($"The syntax is incorrect, expected comment but got '/{next}' at {TokenStartPosition}.");
             }
-
-            return new KVToken(KVTokenType.Comment);
         }
 
-        static bool IsIdentifier(string text)
+        // Unquoted keys, flags and header names must be identifiers, which cannot start with a digit.
+        public static bool IsIdentifier(string text)
         {
-            for (var i = 0; i < text.Length; i++)
+            if (text.Length == 0 || char.IsAsciiDigit(text[0]))
             {
-                var c = text[i];
-
-                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
-                {
-                    continue;
-                }
-
-                if (c >= '0' && c <= '9')
-                {
-                    continue;
-                }
-
-                // TODO: Disallow : because it's a token terminator?
-                if (c == '_' || c == ':' || c == '.')
-                {
-                    continue;
-                }
-
                 return false;
+            }
+
+            foreach (var c in text)
+            {
+                if (!char.IsAsciiLetterOrDigit(c) && c != '_' && c != '.')
+                {
+                    return false;
+                }
             }
 
             return true;
         }
 
+        // Non-ASCII characters are not part of unquoted tokens
+        static bool IsUnquotedTokenChar(int c) => c > ' ' && c < 0x80 && !TokenTerminators.Contains((char)c);
+
         string ReadToken()
         {
+            MarkTokenStart();
+
             var next = Peek();
 
             if (next == '"' || next == '\'')
@@ -317,15 +369,13 @@ namespace ValveKeyValue.Deserialization.KeyValues3
                 return ReadQuotedStringRaw((char)next);
             }
 
-            while (true)
+            return ReadUnquotedToken();
+        }
+
+        string ReadUnquotedToken()
+        {
+            while (IsUnquotedTokenChar(Peek()))
             {
-                next = Peek();
-
-                if (next <= ' ' || TokenTerminators.Contains((char)next))
-                {
-                    break;
-                }
-
                 sb.Append(Next());
             }
 
@@ -338,120 +388,86 @@ namespace ValveKeyValue.Deserialization.KeyValues3
         {
             ReadChar(quotationMark);
 
-            var isMultiline = false;
-
             if (quotationMark == '"' && Peek() == '"')
             {
                 Next();
 
                 // If the next character is not another quote, it's an empty string
-                if (Peek() == '"')
-                {
-                    isMultiline = true;
-
-                    Next();
-
-                    if (Peek() == '\r')
-                    {
-                        Next();
-                    }
-
-                    ReadChar('\n');
-                }
-                else
+                if (Peek() != '"')
                 {
                     return string.Empty;
                 }
+
+                Next();
+
+                if (Peek() == '\r')
+                {
+                    Next();
+                }
+
+                ReadChar('\n');
+                return ReadMultilineStringContents();
             }
 
             var escaped = false;
+            var hasEscapes = false;
 
-            if (isMultiline)
+            while (true)
             {
-                while (true)
+                var next = Next();
+
+                if (next == '\\')
                 {
-                    var next = Next();
-
-                    if (next == '\\')
-                    {
-                        escaped = !escaped;
-                        sb.Append(next);
-                        continue;
-                    }
-
-                    if (next == '"' && !escaped)
-                    {
-                        // Check if this is the start of """
-                        if (Peek() == '"')
-                        {
-                            Next();
-
-                            if (Peek() == '"')
-                            {
-                                Next();
-                                break;
-                            }
-
-                            // Only two quotes, append both
-                            sb.Append(next);
-                            sb.Append('"');
-                            continue;
-                        }
-                    }
-
-                    escaped = false;
+                    escaped = !escaped;
+                    hasEscapes = true;
                     sb.Append(next);
+                    continue;
                 }
 
-                // Strip trailing newline (\n or \r\n)
-                if (sb.Length > 0 && sb[^1] == '\n')
+                if (next == quotationMark && !escaped)
                 {
-                    sb.Length--;
-
-                    if (sb.Length > 0 && sb[^1] == '\r')
-                    {
-                        sb.Length--;
-                    }
+                    break;
                 }
 
+                escaped = false;
+                sb.Append(next);
+            }
+
+            if (!hasEscapes)
+            {
                 var result = sb.ToString();
                 sb.Clear();
                 return result;
             }
-            else
+
+            return UnescapeString();
+        }
+
+        // Reads the contents after the opening """ and its newline. The string only ends at """
+        // at the start of a line, and only when the newline is not preceded by a backslash.
+        string ReadMultilineStringContents()
+        {
+            // Stands in for the newline after the opening """
+            sb.Append('\n');
+
+            while (true)
             {
-                var hasEscapes = false;
+                var next = Next();
+                sb.Append(next);
 
-                while (true)
+                if (next == '"' && sb.Length >= 4 && sb[^2] == '"' && sb[^3] == '"' && sb[^4] == '\n' && (sb.Length == 4 || sb[^5] != '\\'))
                 {
-                    var next = Next();
-
-                    if (next == '\\')
-                    {
-                        escaped = !escaped;
-                        hasEscapes = true;
-                        sb.Append(next);
-                        continue;
-                    }
-
-                    if (next == quotationMark && !escaped)
-                    {
-                        break;
-                    }
-
-                    escaped = false;
-                    sb.Append(next);
+                    break;
                 }
-
-                if (!hasEscapes)
-                {
-                    var result = sb.ToString();
-                    sb.Clear();
-                    return result;
-                }
-
-                return UnescapeString();
             }
+
+            // Drop the closing """ and the newlines next to both quote markers
+            sb.Length -= 3;
+            sb.Replace("\r\n", "\n");
+
+            var result = sb.ToString(1, Math.Max(0, sb.Length - 2)).Replace("\\\"\"\"", "\"\"\"", StringComparison.Ordinal);
+            sb.Clear();
+            return result;
         }
 
         string UnescapeString()

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Linq;
 using System.Text;
 
 namespace ValveKeyValue.Test.TextKV3
@@ -11,6 +12,15 @@ namespace ValveKeyValue.Test.TextKV3
         [
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
             0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xFF
+        ];
+        private static readonly string[] ExpectedQuotedLiterals = ["42", "true", "null", "1.5", "nan"];
+        private static readonly int[] ExpectedCommentedArray = [1, 2];
+        private static readonly string[] ExpectedMultilineArray = ["x", "y"];
+        private static readonly string[] ExpectedUnusualKeys = ["true", "null", "false", "a.b", ".y", "_x", "x_", "", "1abc", "a:b"];
+        private static readonly KVValueType[] ExpectedMixedArrayTypes =
+        [
+            KVValueType.UInt64, KVValueType.String, KVValueType.Array, KVValueType.Collection, KVValueType.BinaryBlob,
+            KVValueType.Null, KVValueType.Boolean, KVValueType.FloatingPoint64, KVValueType.Int64,
         ];
 
         [Test]
@@ -28,7 +38,7 @@ namespace ValveKeyValue.Test.TextKV3
             const string text = "<!-- kv3 encoding:text:version{e21c7f3c-8a33-41c5-9977-a76d3a32aa0d} format:generic:version{7412167c-06e9-4698-aff2-e63eb59037e7} -->\n{\n\tfoo = \"resource\":\"path/to/file.vmdl\"\n}\n";
 
             using var stream = new MemoryStream(Encoding.UTF8.GetBytes(text));
-            Assert.Throws<InvalidOperationException>(() => KVSerializer.Create(KVSerializationFormat.KeyValues3Text).Deserialize(stream));
+            Assert.Throws<KeyValueException>(() => KVSerializer.Create(KVSerializationFormat.KeyValues3Text).Deserialize(stream));
         }
 
         [Test]
@@ -74,7 +84,7 @@ namespace ValveKeyValue.Test.TextKV3
             using (Assert.EnterMultipleScope())
             {
                 Assert.That((string)data["multiLineStringValue"], Is.EqualTo("First line of a multi-line string literal.\nSecond line of a multi-line string literal."));
-                Assert.That((string)data["multiLineWithQuotesInside"], Is.EqualTo("hmm this \\\"\"\"is awkward\n\\\"\"\" yes"));
+                Assert.That((string)data["multiLineWithQuotesInside"], Is.EqualTo("hmm this \"\"\"is awkward\n\"\"\" yes"));
                 Assert.That((string)data["singleQuotesButWithNewLineAnyway"], Is.EqualTo("hello\nvalve"));
             }
         }
@@ -85,7 +95,7 @@ namespace ValveKeyValue.Test.TextKV3
             using var stream = TestDataHelper.OpenResource("TextKV3.multiline_crlf.kv3");
             var data = KVSerializer.Create(KVSerializationFormat.KeyValues3Text).Deserialize(stream);
 
-            Assert.That((string)data["multiLineStringValue"], Is.EqualTo("First line of a multi-line string literal.\r\nSecond line of a multi-line string literal."));
+            Assert.That((string)data["multiLineStringValue"], Is.EqualTo("First line of a multi-line string literal.\nSecond line of a multi-line string literal."));
         }
 
         [Test]
@@ -170,6 +180,19 @@ namespace ValveKeyValue.Test.TextKV3
             {
                 Assert.That(data["name"].Flag, Is.EqualTo(KVFlag.EntityName));
                 Assert.That((string)data["name"], Is.EqualTo("some_entity"));
+            }
+        }
+
+        [Test]
+        public void DeserializesLocalizeFlag()
+        {
+            using var stream = TestDataHelper.OpenResource("TextKV3.localize.kv3");
+            var data = KVSerializer.Create(KVSerializationFormat.KeyValues3Text).Deserialize(stream);
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(data["title"].Flag, Is.EqualTo(KVFlag.Localize));
+                Assert.That((string)data["title"], Is.EqualTo("#SFUI_Title"));
             }
         }
 
@@ -313,7 +336,18 @@ namespace ValveKeyValue.Test.TextKV3
 
             Assert.That(
                 () => KVSerializer.Create(KVSerializationFormat.KeyValues3Text).Deserialize(stream),
-                Throws.Exception.TypeOf<InvalidDataException>());
+                Throws.Exception.TypeOf<KeyValueException>());
+        }
+
+        [Test]
+        public void InvalidHexBlobThrows()
+        {
+            var kv3Text = "<!-- kv3 encoding:text:version{e21c7f3c-8a33-41c5-9977-a76d3a32aa0d} format:generic:version{7412167c-06e9-4698-aff2-e63eb59037e7} -->\n#[ AB ZZ ]";
+            using var stream = new MemoryStream(Encoding.UTF8.GetBytes(kv3Text));
+
+            Assert.That(
+                () => KVSerializer.Create(KVSerializationFormat.KeyValues3Text).Deserialize(stream),
+                Throws.Exception.TypeOf<KeyValueException>());
         }
 
         [Test]
@@ -325,6 +359,225 @@ namespace ValveKeyValue.Test.TextKV3
             Assert.That(
                 () => KVSerializer.Create(KVSerializationFormat.KeyValues3Text).Deserialize(stream),
                 Throws.Exception);
+        }
+
+        [Test]
+        public void QuotedLiteralsAreStrings()
+        {
+            var data = TestDataHelper.ParseKV3Text("{ a = \"42\" b = \"true\" c = \"null\" d = '1.5' e = \"nan\" }");
+
+            Assert.That(data.Root.Values.Select(x => x.ValueType), Is.All.EqualTo(KVValueType.String));
+            Assert.That(data.Root.Values.Select(x => (string)x), Is.EqualTo(ExpectedQuotedLiterals));
+        }
+
+        [Test]
+        public void LiteralsAreCaseInsensitive()
+        {
+            var data = TestDataHelper.ParseKV3Text("{ a = True b = FALSE c = Null d = NaN e = INF f = +inf g = -INF }");
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That((bool)data["a"], Is.True);
+                Assert.That((bool)data["b"], Is.False);
+                Assert.That(data["c"].ValueType, Is.EqualTo(KVValueType.Null));
+                Assert.That((double)data["d"], Is.NaN);
+                Assert.That((double)data["e"], Is.EqualTo(double.PositiveInfinity));
+                Assert.That((double)data["f"], Is.EqualTo(double.PositiveInfinity));
+                Assert.That((double)data["g"], Is.EqualTo(double.NegativeInfinity));
+            }
+        }
+
+        [TestCase("007", 7L)]
+        [TestCase("-0", 0L)]
+        [TestCase("+5", 5L)]
+        [TestCase("+", 0L)]
+        [TestCase("-9223372036854775808", long.MinValue)]
+        public void DeserializesIntegerForms(string text, long expected)
+        {
+            var data = TestDataHelper.ParseKV3Text($"{{ a = {text} }}");
+
+            Assert.That((long)data["a"], Is.EqualTo(expected));
+        }
+
+        [TestCase(".5", 0.5)]
+        [TestCase("-.5", -0.5)]
+        [TestCase("5.", 5.0)]
+        [TestCase("+1.5", 1.5)]
+        [TestCase("1e5", 100000.0)]
+        [TestCase("1E5", 100000.0)]
+        [TestCase("1e+5", 100000.0)]
+        [TestCase("-1.5e-5", -0.000015)]
+        [TestCase("1E-2", 0.01)]
+        [TestCase("1.5e400", double.PositiveInfinity)]
+        [TestCase("1e-400", 0.0)]
+        [TestCase("-0.0", -0.0)]
+        public void DeserializesFloatForms(string text, double expected)
+        {
+            var data = TestDataHelper.ParseKV3Text($"{{ a = {text} }}");
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(data["a"].ValueType, Is.EqualTo(KVValueType.FloatingPoint64));
+                Assert.That((double)data["a"], Is.EqualTo(expected));
+                Assert.That(double.IsNegative((double)data["a"]), Is.EqualTo(double.IsNegative(expected)));
+            }
+        }
+
+        [TestCase("resource:\"x\"")]
+        [TestCase("resource|\"x\"")]
+        [TestCase("resource : \"x\"")]
+        [TestCase("resource\t|\t\"x\"")]
+        [TestCase("resource\n|\n\"x\"")]
+        [TestCase("resource:\n\"x\"")]
+        [TestCase("resource: /* c */ \"x\"")]
+        [TestCase("RESOURCE:\"x\"")]
+        [TestCase("Resource | \"x\"")]
+        [TestCase("resource:\"\"\"\nx\n\"\"\"")]
+        public void DeserializesFlagSyntax(string text)
+        {
+            var data = TestDataHelper.ParseKV3Text($"{{ a = {text} }}");
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(data["a"].Flag, Is.EqualTo(KVFlag.Resource));
+                Assert.That((string)data["a"], Is.EqualTo("x"));
+            }
+        }
+
+        [Test]
+        public void DeserializesNestedFlags()
+        {
+            var data = TestDataHelper.ParseKV3Text("{ a = subclass: { b = [ panorama : \"p\", entity_name:\"e\", \"plain\" ] } c = [ subclass:{ d = 2 }, { e = 3 } ] }");
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(data["a"].Flag, Is.EqualTo(KVFlag.SubClass));
+                Assert.That(data["a"]["b"][0].Flag, Is.EqualTo(KVFlag.Panorama));
+                Assert.That(data["a"]["b"][1].Flag, Is.EqualTo(KVFlag.EntityName));
+                Assert.That(data["a"]["b"][2].Flag, Is.EqualTo(KVFlag.None));
+                Assert.That(data["c"][0].Flag, Is.EqualTo(KVFlag.SubClass));
+                Assert.That(data["c"][1].Flag, Is.EqualTo(KVFlag.None));
+            }
+        }
+
+        [TestCase("#[ 01 02 ]", new byte[] { 1, 2 })]
+        [TestCase("# [ 01 02 ]", new byte[] { 1, 2 })]
+        [TestCase("#[ 01 /* x */ 02 ]", new byte[] { 1, 2 })]
+        [TestCase("# /* c */ [ 01 // x\n 02 /* y */ 03 ]", new byte[] { 1, 2, 3 })]
+        [TestCase("#[ aB Cd ef ]", new byte[] { 0xAB, 0xCD, 0xEF })]
+        [TestCase("#[]", new byte[0])]
+        [TestCase("#[ ]", new byte[0])]
+        [TestCase("#[\n]", new byte[0])]
+        public void DeserializesBinaryBlobSyntax(string text, byte[] expected)
+        {
+            var data = TestDataHelper.ParseKV3Text($"{{ a = {text} }}");
+
+            Assert.That(data["a"].AsBlob(), Is.EqualTo(expected));
+        }
+
+        [TestCase("\n")]
+        [TestCase("\r\n")]
+        public void LineCommentContinuesAfterBackslash(string newline)
+        {
+            var data = TestDataHelper.ParseKV3Text($"{{{newline}\t// comment \\{newline}\tb = 2{newline}\tc = 3{newline}}}");
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(data.Root.ContainsKey("b"), Is.False);
+                Assert.That((int)data["c"], Is.EqualTo(3));
+            }
+        }
+
+        [Test]
+        public void DeserializesCommentsBetweenTokens()
+        {
+            var data = TestDataHelper.ParseKV3Text("{ /*a*/ a /*b*/ = /*c*/ 1 /*d*/ b = [ /*e*/ 1 /*f*/ , /*g*/ 2 /*h*/ ] /*i*/ c // x\n = 3 }");
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That((int)data["a"], Is.EqualTo(1));
+                Assert.That(data["b"].Values.Select(x => (int)x), Is.EqualTo(ExpectedCommentedArray));
+                Assert.That((int)data["c"], Is.EqualTo(3));
+            }
+        }
+
+        [TestCase("\"\"\"\nabc\"\"\" b = 1\n\"\"\"", "abc\"\"\" b = 1")]
+        [TestCase("\"\"\"\nline\\\n\"\"\"\nstill\n\"\"\"", "line\\\n\"\"\"\nstill")]
+        [TestCase("\"\"\"\n\\\"\"\"x\n\"\"\"", "\"\"\"x")]
+        [TestCase("\"\"\"\nx \\\"\"\" y\n\"\"\"", "x \"\"\" y")]
+        [TestCase("\"\"\"\r\nline1\r\nline2\r\n\"\"\"", "line1\nline2")]
+        [TestCase("\"\"\"\nx\r\ny\r\n\"\"\"", "x\ny")]
+        [TestCase("\"\"\"\n\"\"\"", "")]
+        [TestCase("\"\"\"\r\n\"\"\"", "")]
+        [TestCase("\"\"\"\n\n\"\"\"", "")]
+        [TestCase("\"\"\"\n\n\nx\n\n\"\"\"", "\n\nx\n")]
+        [TestCase("\"\"\"\n\tline\n\t\"\"\"\n\tb = 1\n\"\"\"", "\tline\n\t\"\"\"\n\tb = 1")]
+        [TestCase("\"\"\"\n\"\"\n\"x\"\n\"\"\"", "\"\"\n\"x\"")]
+        [TestCase("\"\"\"\nx\\ny\\t\n\"\"\"", "x\\ny\\t")]
+        public void DeserializesMultilineStringSyntax(string text, string expected)
+        {
+            var data = TestDataHelper.ParseKV3Text($"{{\n\ta = {text}\n}}");
+
+            Assert.That((string)data["a"], Is.EqualTo(expected));
+        }
+
+        [Test]
+        public void DeserializesMultilineStringsInArrayAndKey()
+        {
+            var data = TestDataHelper.ParseKV3Text("{\n\ta = [ \"\"\"\nx\n\"\"\", \"\"\"\ny\n\"\"\"]\n\"\"\"\nkey\nname\n\"\"\" = 1\n}");
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(data["a"].Values.Select(x => (string)x), Is.EqualTo(ExpectedMultilineArray));
+                Assert.That((int)data["key\nname"], Is.EqualTo(1));
+            }
+        }
+
+        [Test]
+        public void DeserializesUnusualKeys()
+        {
+            var data = TestDataHelper.ParseKV3Text("{ true = 1 null = 2 false = 3 a.b = 4 .y = 5 _x = 6 x_ = 7 \"\" = 8 \"1abc\" = 9 \"a:b\" = 10 }");
+
+            Assert.That(data.Root.Keys, Is.EqualTo(ExpectedUnusualKeys));
+        }
+
+        [Test]
+        public void DeserializesVerticalTabAndFormFeedAsWhitespace()
+        {
+            var data = TestDataHelper.ParseKV3Text("{\va = 1\f}");
+
+            Assert.That((int)data["a"], Is.EqualTo(1));
+        }
+
+        [Test]
+        public void DeserializesContainersWithoutWhitespace()
+        {
+            var data = TestDataHelper.ParseKV3Text("{a=1 b=[1,2,] c={d=\"x\"} e=[[]] f={g={}} h=[{}] i=[1,\"a\",[2],{j=3},#[01],null,true,1.5,-2]}");
+
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That((int)data["a"], Is.EqualTo(1));
+                Assert.That(data["b"].Count, Is.EqualTo(2));
+                Assert.That((string)data["c"]["d"], Is.EqualTo("x"));
+                Assert.That(data["e"][0].Count, Is.EqualTo(0));
+                Assert.That(data["f"]["g"].Count, Is.EqualTo(0));
+                Assert.That(data["h"][0].ValueType, Is.EqualTo(KVValueType.Collection));
+                Assert.That(data["i"].Values.Select(x => x.ValueType), Is.EqualTo(ExpectedMixedArrayTypes));
+            }
+        }
+
+        [Test]
+        public void DeserializesDeeplyNestedArrays()
+        {
+            var data = TestDataHelper.ParseKV3Text("{ a = " + new string('[', 50) + "1" + new string(']', 50) + " }");
+
+            var value = data["a"];
+            for (var i = 0; i < 50; i++)
+            {
+                value = value[0];
+            }
+
+            Assert.That((int)value, Is.EqualTo(1));
         }
 
 #pragma warning disable CA1812 // Avoid uninstantiated internal classes - used by deserializer
